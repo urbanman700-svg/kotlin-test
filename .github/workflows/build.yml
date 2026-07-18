@@ -1,0 +1,95 @@
+name: Android Build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pre-build Checks (Target SDK 35 & ProGuard)
+        env:
+          ENABLE_PROGUARD: "false"
+        run: |
+          find . -name "build.gradle*" -exec sed -i 's/targetSdk = 3[0-4]/targetSdk = 35/g' {} + || true
+          find . -name "build.gradle*" -exec sed -i 's/targetSdk 3[0-4]/targetSdk 35/g' {} + || true
+          find . -name "build.gradle*" -exec sed -i 's/compileSdk = 3[0-4]/compileSdk = 35/g' {} + || true
+          find . -name "build.gradle*" -exec sed -i 's/compileSdk 3[0-4]/compileSdk 35/g' {} + || true
+          if [ "$ENABLE_PROGUARD" = "true" ]; then
+            find . -name "build.gradle*" -exec sed -i 's/isMinifyEnabled = false/isMinifyEnabled = true/g' {} + || true
+            find . -name "build.gradle*" -exec sed -i 's/minifyEnabled false/minifyEnabled true/g' {} + || true
+          fi
+      - name: set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+      - name: Regenerate Gradle Wrapper
+        run: |
+          rm -f gradle/wrapper/gradle-wrapper.jar || true
+          gradle wrapper --gradle-version 8.7 || true
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew || true
+      - name: Build with Gradle
+        env:
+          BUILD_FORMAT: "apk"
+          GRADLE_DEBUG_TASK: "assembleDebug"
+          IS_RELEASE: "true"
+        run: |
+          if [ "$IS_RELEASE" = "true" ]; then
+            if [ "$BUILD_FORMAT" = "aab" ]; then
+              GRADLE_TASK="bundleRelease"
+            else
+              GRADLE_TASK="assembleRelease"
+            fi
+          else
+            GRADLE_TASK="assembleDebug"
+          fi
+          
+          if [ -f "./gradlew" ]; then
+            ./gradlew $GRADLE_TASK --no-daemon
+          else
+            gradle $GRADLE_TASK --no-daemon
+          fi
+      - name: Sign Release Artifact (Debug Keystore)
+        env:
+          BUILD_FORMAT: "apk"
+        run: |
+          # 1. Generate debug keystore
+          keytool -genkey -v -keystore release.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          
+          # 2. Create output directory
+          mkdir -p dist-out
+          
+          # 3. Perform signing
+          if [ "$BUILD_FORMAT" = "aab" ]; then
+            TARGET_AAB=$(find . -name "*.aab" | grep -v "node_modules" | head -n 1)
+            if [ -n "$TARGET_AAB" ]; then
+              echo "Signing AAB: $TARGET_AAB"
+              jarsigner -keystore release.keystore -storepass android -keypass android "$TARGET_AAB" androiddebugkey
+              cp "$TARGET_AAB" dist-out/app-release.aab
+              echo "AAB signed successfully"
+            else
+              echo "Error: Could not find any AAB files to sign"
+              exit 1
+            fi
+          else
+            TARGET_APK=$(find . -name "*unsigned.apk" -o -name "*release.apk" | grep -v "node_modules" | head -n 1)
+            if [ -n "$TARGET_APK" ]; then
+              echo "Signing APK: $TARGET_APK"
+              APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" | sort -V | tail -n 1)
+              $APKSIGNER sign --ks release.keystore --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android --out dist-out/app-release.apk "$TARGET_APK"
+              echo "APK signed successfully"
+            else
+              echo "Error: Could not find any APK files to sign"
+              exit 1
+            fi
+          fi
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-signed-apk
+          path: |
+            dist-out/app-release.apk
+      
